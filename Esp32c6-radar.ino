@@ -1,7 +1,7 @@
 #define SERVO_PIN 18
 
-int CENTER_US = 1499;
-int SPAN_US   = 50;
+int CENTER_US = 1498.5;
+int SPAN_US   = 70;
 
 int STEP_US   = 3;   // 2..4 обычно идеально; 1 часто даёт дрейф
 int cur;
