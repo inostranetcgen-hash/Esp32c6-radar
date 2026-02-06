@@ -1,47 +1,36 @@
-#include <Arduino.h>
-
 #define SERVO_PIN 18
 
-// Для сервопривода нам нужно 50 Гц.
-// В новом core (3.x) ledcSetup/ledcAttachPin могут отсутствовать.
-// Используем новый API: ledcAttach + ledcWrite / ledcWriteTone.
+int currentPulse = 1500;   // старт с центра
+int minPulse = 1200;       // -90°
+int maxPulse = 1800;       // +90°
+int step = 5;              // МЕНЬШЕ = МЕДЛЕННЕЕ
+int stepDelay = 25;        // МЕНЬШЕ = БЫСТРЕЕ
 
-static const int SERVO_FREQ = 50;         // 50 Hz
-static const int SERVO_RES_BITS = 16;     // 16-bit
-static const int SERVO_CHANNEL = 0;
+void pulse(int us) {
+  digitalWrite(SERVO_PIN, HIGH);
+  delayMicroseconds(us);
+  digitalWrite(SERVO_PIN, LOW);
+  delay(20);
+}
 
-// 16 бит: 0..65535. Период 20ms.
-// 0.5ms = 2.5% => 65535*0.025 ≈ 1638
-// 2.5ms = 12.5% => 65535*0.125 ≈ 8192
-static const uint32_t dutyMin = 1638;
-static const uint32_t dutyMax = 8192;
+void moveTo(int target) {
+  while (currentPulse != target) {
+    if (currentPulse < target) currentPulse += step;
+    if (currentPulse > target) currentPulse -= step;
+
+    pulse(currentPulse);
+    delay(stepDelay);
+  }
+}
 
 void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println("ESP32-C6 Servo test (new LEDC)");
-
-  // Новый вызов: ledcAttach(pin, freq, resolution)
-  // Если на твоём core сигнатура другая, лог скажет — я подстрою.
-  ledcAttach(SERVO_PIN, SERVO_FREQ, SERVO_RES_BITS);
-
-  // Некоторые сборки используют канал неявно.
-  // Если потребуется канал — будет видно по ошибке.
+  pinMode(SERVO_PIN, OUTPUT);
 }
 
 void loop() {
-  // sweep вперед
-  for (uint32_t duty = dutyMin; duty <= dutyMax; duty += 60) {
-    ledcWrite(SERVO_PIN, duty);  // в новом API иногда пишут по pin
-    delay(20);
-  }
-  delay(300);
+  moveTo(minPulse);  // влево
+  delay(500);
 
-  // sweep назад
-  for (uint32_t duty = dutyMax; duty >= dutyMin; duty -= 60) {
-    ledcWrite(SERVO_PIN, duty);
-    delay(20);
-    if (duty < dutyMin + 60) break;
-  }
-  delay(300);
+  moveTo(maxPulse);  // вправо
+  delay(500);
 }
