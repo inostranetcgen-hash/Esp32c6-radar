@@ -1,66 +1,60 @@
 #define SERVO_PIN 18
 
-int CENTER_US = 1498.8;   // стартовое, будем подбирать потом
-int SPAN_US   = 60;     // начни с 60, потом вернём 70
-int STEP_US   = 2;      // 2..4
+// БАЗА
+int CENTER_US = 1499;
 
-inline int minPulse() { return CENTER_US - SPAN_US; }
-inline int maxPulse() { return CENTER_US + SPAN_US; }
+// Пределы отдельно (если уезжает влево — делаем вправо ЧУТЬ больше или влево ЧУТЬ меньше)
+int LEFT_SPAN_US  = 60;   // левый предел = CENTER - LEFT_SPAN_US
+int RIGHT_SPAN_US = 65;   // правый предел = CENTER + RIGHT_SPAN_US
 
-int cur;
-int dir = +1;
-int turnCount = 0;
+// Плавность/скорость (важно: серво должно успевать)
+int STEP_US = 1;          // шаг
+int MOVE_EVERY_FRAMES = 2; // двигаем позицию раз в N кадров (2 = медленнее и плавнее), но импульсы идут каждый кадр
+
+// Компенсация люфта по направлению (подбирается)
+// Если диапазон уезжает ВЛЕВО -> обычно помогает чуть "подтолкнуть" вправо при движении вправо
+int BIAS_WHEN_MOVING_RIGHT = +3; // +2..+6
+int BIAS_WHEN_MOVING_LEFT  = 0;  // обычно 0..+2
+
+int cur = 1499;
+int dir = +1;   // +1 вправо, -1 влево
+int frame = 0;
+
+inline int minPulse() { return CENTER_US - LEFT_SPAN_US; }
+inline int maxPulse() { return CENTER_US + RIGHT_SPAN_US; }
 
 void pulse50(int us) {
   digitalWrite(SERVO_PIN, HIGH);
   delayMicroseconds(us);
   digitalWrite(SERVO_PIN, LOW);
-  delayMicroseconds(20000 - us);
-}
-
-void hold(int us, int frames) {  // frames * 20ms
-  for (int i = 0; i < frames; i++) pulse50(us);
-}
-
-void moveSmooth(int from, int to) {
-  int step = (from < to) ? STEP_US : -STEP_US;
-  int v = from;
-  while (v != to) {
-    pulse50(v);
-    int next = v + step;
-    if ((step > 0 && next > to) || (step < 0 && next < to)) next = to;
-    v = next;
-  }
-}
-
-void recenterSoft() {
-  // мягко вернуться в центр и чуть подержать, чтобы сбросить накопление
-  moveSmooth(cur, CENTER_US);
-  hold(CENTER_US, 6);   // 6 кадров = 120мс (почти не видно как пауза)
-  cur = CENTER_US;
+  delayMicroseconds(20000 - us); // ровно 20мс период
 }
 
 void setup() {
   pinMode(SERVO_PIN, OUTPUT);
   cur = CENTER_US;
-  hold(CENTER_US, 10);  // стабилизация старта
+
+  // стабилизация на старте
+  for (int i = 0; i < 20; i++) pulse50(CENTER_US);
 }
 
 void loop() {
-  pulse50(cur);
+  // Команда с компенсацией люфта
+  int cmd = cur + (dir > 0 ? BIAS_WHEN_MOVING_RIGHT : BIAS_WHEN_MOVING_LEFT);
+
+  // защитим от выхода за пределы
+  if (cmd < minPulse()) cmd = minPulse();
+  if (cmd > maxPulse()) cmd = maxPulse();
+
+  // подаём импульс каждый кадр
+  pulse50(cmd);
+
+  // а позицию меняем реже -> серво успевает, движение выглядит плавнее
+  frame++;
+  if (frame % MOVE_EVERY_FRAMES != 0) return;
 
   cur += dir * STEP_US;
 
-  if (cur >= maxPulse()) {
-    cur = maxPulse();
-    dir = -1;
-    turnCount++;
-    recenterSoft();     // ключ: сброс дрейфа на каждом развороте
-  } 
-  else if (cur <= minPulse()) {
-    cur = minPulse();
-    dir = +1;
-    turnCount++;
-    recenterSoft();     // ключ: сброс дрейфа на каждом развороте
-  }
+  if (cur >= maxPulse()) { cur = maxPulse(); dir = -1; }
+  if (cur <= minPulse()) { cur = minPulse(); dir = +1; }
 }
