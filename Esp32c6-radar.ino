@@ -1,16 +1,16 @@
 #define SERVO_PIN 18
 
-// Настройки диапазона (сузь, если всё ещё натягивает провода)
-const int CENTER = 1500;     // центр
-const int LEFT   = 1350;     // левее (уменьши к 1400 если нужно меньше)
-const int RIGHT  = 1650;     // правее (уменьши к 1600 если нужно меньше)
+// === НАСТРОЙ ДИАПАЗОНА ===
+// Центр почти всегда 1500 мкс.
+// Поставь безопасно узко, потом расширишь.
+int minPulse = 1450;  // левый предел (меньше -> больше поворот)
+int maxPulse = 1550;  // правый предел (больше -> больше поворот)
 
-// Скорость
-const int STEP_US = 1;       // 1 = очень медленно, 2..5 быстрее
-const int HOLD_MS = 400;     // пауза на краях
+// === СКОРОСТЬ ===
+int stepUs = 1;       // 1 = медленно, 2..5 быстрее
 
-int cur = CENTER;
-int target = RIGHT;
+int cur = 1500;
+int dir = +1;
 
 void pulse(int us) {
   digitalWrite(SERVO_PIN, HIGH);
@@ -18,26 +18,18 @@ void pulse(int us) {
   digitalWrite(SERVO_PIN, LOW);
 }
 
-unsigned long lastEdge = 0;
-
 void setup() {
   pinMode(SERVO_PIN, OUTPUT);
 }
 
 void loop() {
-  // Всегда держим 50 Гц: 20 мс период
+  // 50 Гц — всегда выдаём импульс раз в 20 мс
   pulse(cur);
   delay(20);
 
-  // Медленно двигаем к цели
-  if (cur < target) cur += STEP_US;
-  else if (cur > target) cur -= STEP_US;
+  // постоянно изменяем позицию в пределах диапазона
+  cur += dir * stepUs;
 
-  // Если дошли до края — держим и меняем направление
-  if (cur == target) {
-    if (millis() - lastEdge > (unsigned long)HOLD_MS) {
-      lastEdge = millis();
-      target = (target == RIGHT) ? LEFT : RIGHT;
-    }
-  }
+  if (cur >= maxPulse) { cur = maxPulse; dir = -1; }
+  if (cur <= minPulse) { cur = minPulse; dir = +1; }
 }
