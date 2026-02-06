@@ -1,8 +1,8 @@
 #define SERVO_PIN 18
 
-int CENTER_US = 1499;   // стартовое, будем подбирать потом
+int CENTER_US = 1498.8;   // стартовое, будем подбирать потом
 int SPAN_US   = 60;     // начни с 60, потом вернём 70
-int STEP_US   = 3;      // 2..4
+int STEP_US   = 2;      // 2..4
 
 inline int minPulse() { return CENTER_US - SPAN_US; }
 inline int maxPulse() { return CENTER_US + SPAN_US; }
