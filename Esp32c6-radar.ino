@@ -1,1018 +1,882 @@
-/*
-  ESP32‑C6 Radar + Servo scanner + Web UI (2 tabs) + Voice (browser)
-  Sensor: HLK‑LD2420 (UART basic status: "ON"/"OFF" + "Range XXXX")
-  Servo: SG90 on SERVO_PIN (default GPIO18)
-
-  Works with ESP32 Arduino core 3.x (ledcAttach/ledcWrite new API).
-*/
-
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <Update.h>
 
-// -------------------- ПИНЫ (под твою сборку) --------------------
+// -------------------- ВЕРСИЯ --------------------
+static const char* APP_VERSION = "RLS-C6 v2.0 (servo stable + power logic + battery)";
 
-// Серво (ты сказал, что подключено в отверстие "18")
-#define SERVO_PIN 18
+// -------------------- WIFI AP --------------------
+static const char* AP_SSID = "RLS-ESP32C6";
+static const char* AP_PASS = "12345678"; // минимум 8 символов
 
-// LD2420 OUT (если подключал провод в "0" — обычно это GPIO0)
-// Можно не использовать OUT, но оставим как дополнительный индикатор.
-#define RADAR_OUT_PIN 0      // поставь -1 если OUT не подключён
-
-// UART радара (LD2420). ВАЖНО: выставь под свои провода!
-#define RADAR_BAUD 115200
-
-// Вариант А (рекомендуется): радар на Serial1 (отдельные пины, не мешает USB)
-#define RADAR_USE_SERIAL0 0  // 0=Serial1, 1=Serial (если ты реально воткнул радар в TX/RX которые делят USB)
-
-// Эти пины поменяй под себя, если радар на Serial1.
-// Если не уверен — скажи какие номера пинов на плате у RX/TX куда воткнул радар.
-#define RADAR_RX_PIN 20
-#define RADAR_TX_PIN 21
-
-// Управление питанием радара (ТОЛЬКО если у тебя стоит MOSFET/ключ/EN пин у DC-DC)
-// Если нет — оставь -1, будет “выключение” только программно.
-#define RADAR_PWR_PIN -1
-#define RADAR_PWR_ACTIVE_HIGH 1
-
-// Измерение батареи (если сделаешь делитель на ADC). Если нет — оставь -1.
-#define BATTERY_ADC_PIN -1
-#define BATTERY_DIVIDER_RATIO 2.0f   // 100k/100k => 2.0 (4.2В -> 2.1В на ADC)
-
-// -------------------- Wi‑Fi AP --------------------
-static const char *AP_SSID = "RLS-RADAR";
-static const char *AP_PASS = "12345678"; // минимум 8 символов
-
-// -------------------- Серво PWM (LEDC) --------------------
-static const uint16_t SERVO_FREQ = 50;       // 50Hz
-static const uint8_t  SERVO_RES  = 16;       // 16-bit
-static const uint32_t SERVO_MAX_DUTY = (1UL << SERVO_RES) - 1;
-static const uint32_t SERVO_PERIOD_US = 1000000UL / SERVO_FREQ; // 20000us
-
-// -------------------- Web --------------------
 WebServer server(80);
 Preferences prefs;
 
-// -------------------- Настройки, которые сохраняем --------------------
-struct Settings {
-  int center_us;
-  int left_span_us;
-  int right_span_us;
-  int bias_right_us;
-  int bias_left_us;
-  int scan_period_ms;   // полный цикл (лево->право->лево)
-  int tick_ms;          // как часто обновляем команду серво
-  bool servo_hold;      // удерживать PWM когда “стоп”
+// -------------------- ПИНЫ --------------------
+// Сервопривод (как у тебя)
+static const int SERVO_PIN = 18;
+
+// Опционально: если поставишь MOSFET на питание сервопривода 5V,
+// то укажи пин управления тут. -1 = нет ключа питания.
+static const int SERVO_PWR_PIN = -1;   // например 5, 6, 7... (любой свободный GPIO)
+
+// Радар OUT (если подключён) — у тебя часто это GPIO0
+static const int RADAR_OUT_PIN = 0;
+
+// Опционально: если поставишь MOSFET/ключ питания 3.3V на радар
+static const int RADAR_PWR_PIN = -1;   // любой свободный GPIO, через MOSFET/LoadSwitch
+
+// Опционально: батарея через делитель на ADC
+static const int BAT_ADC_PIN = -1;     // например 1,2,3... (любой ADC GPIO)
+static const float BAT_DIVIDER = 2.0f; // 100k/100k => 2.0
+static const float BAT_VMIN = 3.20f;   // 0%
+static const float BAT_VMAX = 4.20f;   // 100%
+
+// -------------------- УТИЛИТЫ --------------------
+static int clampi(int v, int lo, int hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
+static float clampf(float v, float lo, float hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
+
+static String jsonEscape(const String& s) {
+  String out; out.reserve(s.length()+8);
+  for (size_t i=0;i<s.length();i++){
+    char c = s[i];
+    if (c=='\\') out += "\\\\";
+    else if (c=='"') out += "\\\"";
+    else if (c=='\n') out += "\\n";
+    else if (c=='\r') out += "\\r";
+    else out += c;
+  }
+  return out;
+}
+
+// -------------------- КОНФИГ --------------------
+struct Config {
+  int center_us = 1500;
+  int left_span_us = 100;
+  int right_span_us = 100;
+  int bias_right_us = 0;
+  int bias_left_us = 0;
+
+  int scan_period_ms = 9000;   // полный цикл туда-обратно
+  int tick_ms = 120;           // обновление UI (мс)
+  int ease_pct = 35;           // 0..100 (плавное замедление к краям)
+  int end_hold_ms = 0;         // пауза в краях (лучше 0)
+
+  bool servo_hold_when_stop = false; // если true — держать последнюю позицию (PWM остается). Если false — PWM OFF.
+  bool failsafe_stop = false;        // если true — без активности в UI остановит серво и радар
+  int  failsafe_sec = 60;            // через сколько секунд
+
+  // радар
+  bool radar_enabled_default = false; // при старте выключен
 };
 
-Settings cfg;
+Config cfg;
 
-// -------------------- Состояния --------------------
-bool servo_enabled = false;      // важно: после питания НЕ стартуем
-bool servo_attached = false;
+// -------------------- СОСТОЯНИЯ --------------------
+static bool servo_scan_on = false;       // “Сканирование: СТАРТ/СТОП”
+static bool servo_pwm_on  = false;       // реально подаём импульсы или нет
+static bool radar_on      = false;       // логика радара вкл/выкл
+static bool radar_powered = false;       // питание через ключ (если есть)
 
-bool radar_enabled = true;
-bool radar_powered = true;
+static uint32_t scan_start_ms = 0;
+static int servo_us_cmd = 1500;
+static char servo_dir = 'R';
 
-uint32_t scan_start_ms = 0;
-uint32_t last_servo_update_ms = 0;
+static uint32_t last_client_ms = 0;
 
-int servo_us_cmd = 1500;
-int servo_dir = +1; // +1 = вправо, -1 = влево
+// -------------------- SPEAK EVENT (для браузера) --------------------
+static uint32_t speak_seq = 0;
+static String speak_text = "";
 
-// Radar данные (из UART basic mode)
-bool radar_presence = false;
-int  radar_range_cm = 0;
+// -------------------- BAT --------------------
+static uint32_t last_bat_ms = 0;
+static float bat_v = NAN;
+static int bat_pct = -1;
 
-uint32_t last_radar_line_ms = 0;
-uint32_t last_range_ms = 0;
+// -------------------- RADAR “движение/тихо” --------------------
+static bool motion_now = false;
+static bool motion_prev = false;
+static uint32_t last_motion_ms = 0;
+static bool said_clear = false;
 
-float speed_kmh = 0.0f;     // + = удаляется (дистанция растёт), - = приближается
-int   move_dir = 0;         // +1 away, -1 to us, 0 unknown
+// -------------------- HIT POINTS --------------------
+struct Hit {
+  float angle_deg;
+  float range_cm;
+  float v_kmh;
+  int dir;              // +1 к нам, -1 от нас, 0 неизвестно
+  uint32_t ts;
+};
+static const int MAX_HITS = 32;
+static Hit hits[MAX_HITS];
+static int hit_head = 0;
 
-// Для расчёта скорости
-bool have_prev_range = false;
-int  prev_range_cm = 0;
-uint32_t prev_range_ms = 0;
+static void addHit(float angle, float range_cm, float v_kmh, int dir) {
+  hits[hit_head] = {angle, range_cm, v_kmh, dir, millis()};
+  hit_head = (hit_head + 1) % MAX_HITS;
+}
 
-// Battery
-float battery_v = NAN;
-int battery_pct = -1;
-uint32_t last_batt_ms = 0;
+// -------------------- ПИТАНИЕ КЛЮЧЕЙ --------------------
+static void servoPower(bool on) {
+  if (SERVO_PWR_PIN >= 0) {
+    pinMode(SERVO_PWR_PIN, OUTPUT);
+    digitalWrite(SERVO_PWR_PIN, on ? HIGH : LOW);
+  }
+}
+static void radarPower(bool on) {
+  if (RADAR_PWR_PIN >= 0) {
+    pinMode(RADAR_PWR_PIN, OUTPUT);
+    digitalWrite(RADAR_PWR_PIN, on ? HIGH : LOW);
+    radar_powered = on;
+  } else {
+    radar_powered = on; // логическое состояние (для UI)
+  }
+}
 
-// -------------------- UART радара --------------------
-#if RADAR_USE_SERIAL0
-  #define DBG(...) do{}while(0)
-  #define DBGLN(...) do{}while(0)
-  // В этом режиме Serial занят радаром => логов не будет
-#else
-  #define DBG(...)   Serial.print(__VA_ARGS__)
-  #define DBGLN(...) Serial.println(__VA_ARGS__)
-  HardwareSerial RadarSerial(1);
-#endif
+// -------------------- SERVO: РУЧНОЙ PWM 50Hz --------------------
+static uint32_t next_pulse_ms = 0;
 
-// -------------------- Утилиты --------------------
-static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static void servoPWM(bool on) {
+  servo_pwm_on = on;
+  if (!on) {
+    pinMode(SERVO_PIN, OUTPUT);
+    digitalWrite(SERVO_PIN, LOW);
+  } else {
+    next_pulse_ms = millis();
+  }
+}
 
-static uint32_t usToDuty(int us) {
+static void servoPulseUs(int us) {
   us = clampi(us, 500, 2500);
-  // duty = us / period * maxDuty
-  return (uint32_t)((uint64_t)us * SERVO_MAX_DUTY / SERVO_PERIOD_US);
-}
-
-static void servoAttachIfNeeded() {
-  if (servo_attached) return;
-  // новый API (ESP32 core 3.x)
-  ledcAttach(SERVO_PIN, SERVO_FREQ, SERVO_RES);
-  servo_attached = true;
-}
-
-static void servoDetachIfNeeded() {
-  if (!servo_attached) return;
-  ledcDetach(SERVO_PIN);
-  pinMode(SERVO_PIN, OUTPUT);
+  digitalWrite(SERVO_PIN, HIGH);
+  delayMicroseconds(us);
   digitalWrite(SERVO_PIN, LOW);
-  servo_attached = false;
 }
 
-static void servoWriteUs(int us) {
-  servoAttachIfNeeded();
-  servo_us_cmd = clampi(us, 500, 2500);
-  ledcWrite(SERVO_PIN, usToDuty(servo_us_cmd));
-}
-
-// Удобный “угол” 0..180, где 90 — центр
-static int servoAngleDegFromUs(int us) {
-  int c = cfg.center_us;
-  int L = max(1, cfg.left_span_us);
-  int R = max(1, cfg.right_span_us);
-
-  if (us <= c) {
-    float t = float(c - us) / float(L);
-    t = constrain(t, 0.0f, 1.0f);
-    return (int)roundf(90.0f - 90.0f * t);
-  } else {
-    float t = float(us - c) / float(R);
-    t = constrain(t, 0.0f, 1.0f);
-    return (int)roundf(90.0f + 90.0f * t);
+static void servoService50Hz() {
+  if (!servo_pwm_on) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - next_pulse_ms) >= 0) {
+    servoPulseUs(servo_us_cmd);
+    next_pulse_ms = now + 20;
   }
 }
 
-// -------------------- LD2420 команды (по протоколу) --------------------
-// Берём формат кадров из документации/реализаций (FD FC FB FA ... 04 03 02 01)
-static void ld2420SendFrame(uint16_t cmd, const uint8_t *payload, uint16_t payloadLen) {
-#if RADAR_USE_SERIAL0
-  // Serial == радар
-  auto &S = Serial;
-#else
-  auto &S = RadarSerial;
-#endif
-  uint8_t buf[64];
-  uint16_t len = 2 + payloadLen;
-  if (len + 8 > sizeof(buf)) return;
+// Плавная траектория без накопления ошибок
+static float smoothstep(float x) { return x * x * (3.0f - 2.0f * x); }
 
-  buf[0] = 0xFD; buf[1] = 0xFC; buf[2] = 0xFB; buf[3] = 0xFA;
-  buf[4] = (uint8_t)(len & 0xFF);
-  buf[5] = (uint8_t)(len >> 8);
-  buf[6] = (uint8_t)(cmd & 0xFF);
-  buf[7] = (uint8_t)(cmd >> 8);
+static void servoScanService() {
+  if (!servo_scan_on) return;
 
-  for (uint16_t i = 0; i < payloadLen; i++) buf[8 + i] = payload[i];
-
-  uint16_t p = 8 + payloadLen;
-  buf[p + 0] = 0x04; buf[p + 1] = 0x03; buf[p + 2] = 0x02; buf[p + 3] = 0x01;
-
-  S.write(buf, p + 4);
-  S.flush();
-}
-
-static void ld2420SetBasicStatusMode() {
-  // Enable config mode: FF 00 + protocol ver 02 00
-  const uint8_t proto[] = {0x02, 0x00};
-  ld2420SendFrame(0x00FF, proto, sizeof(proto));
-  delay(120);
-
-  // Set sys param: cmd 12 00, payload: paramId 00 00, value 64 00 00 00 (basic status)
-  const uint8_t sys_basic[] = {0x00, 0x00, 0x64, 0x00, 0x00, 0x00};
-  ld2420SendFrame(0x0012, sys_basic, sizeof(sys_basic));
-  delay(120);
-
-  // Disable config mode: FE 00
-  ld2420SendFrame(0x00FE, nullptr, 0);
-  delay(120);
-}
-
-// -------------------- Radar parsing (text mode) --------------------
-static String radarLine;
-
-static void radarProcessLine(String s) {
-  s.trim();
-  if (s.length() == 0) return;
-
-  last_radar_line_ms = millis();
-
-  // Возможные варианты строк: "ON", "OFF", "Range 123", "Range: 123"
-  if (s == "ON") {
-    radar_presence = true;
-    return;
-  }
-  if (s == "OFF") {
-    radar_presence = false;
-    return;
-  }
-
-  int idx = s.indexOf("Range");
-  if (idx >= 0) {
-    // вытаскиваем число
-    int num = 0;
-    bool found = false;
-    for (int i = idx; i < (int)s.length(); i++) {
-      if (isDigit((unsigned char)s[i])) {
-        found = true;
-        num = atoi(s.c_str() + i);
-        break;
-      }
-    }
-    if (found && num > 0 && num < 20000) {
-      radar_range_cm = num;
-      last_range_ms = millis();
-
-      // скорость
-      if (!have_prev_range) {
-        have_prev_range = true;
-        prev_range_cm = radar_range_cm;
-        prev_range_ms = last_range_ms;
-        speed_kmh = 0;
-        move_dir = 0;
-      } else {
-        uint32_t dt = last_range_ms - prev_range_ms;
-        if (dt >= 150) {
-          float dist_m = radar_range_cm / 100.0f;
-          float prev_m = prev_range_cm / 100.0f;
-          float dt_s = dt / 1000.0f;
-          float inst_ms = (dist_m - prev_m) / dt_s;   // + => растёт дистанция
-          float inst_kmh = inst_ms * 3.6f;
-
-          // сглаживание
-          speed_kmh = 0.80f * speed_kmh + 0.20f * inst_kmh;
-
-          const float TH = 0.8f; // порог “движется”
-          if (speed_kmh > TH) move_dir = +1;       // away
-          else if (speed_kmh < -TH) move_dir = -1; // to us
-          else move_dir = 0;
-
-          prev_range_cm = radar_range_cm;
-          prev_range_ms = last_range_ms;
-        }
-      }
-    }
-  }
-}
-
-static void radarPollSerial() {
-  if (!radar_enabled) return;
-
-#if RADAR_USE_SERIAL0
-  auto &S = Serial;
-#else
-  auto &S = RadarSerial;
-#endif
-
-  while (S.available()) {
-    char c = (char)S.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      radarProcessLine(radarLine);
-      radarLine = "";
-    } else {
-      if (radarLine.length() < 80) radarLine += c;
-    }
-  }
-}
-
-// -------------------- Battery --------------------
-static int socFromVoltage(float v) {
-  // грубая таблица Li-Ion (без нагрузки сильно точнее не будет)
-  struct P { float v; int p; };
-  const P t[] = {
-    {4.20f, 100}, {4.10f, 90}, {4.00f, 80}, {3.92f, 70}, {3.85f, 60},
-    {3.79f, 50},  {3.73f, 40}, {3.68f, 30}, {3.62f, 20}, {3.55f, 10},
-    {3.30f, 0}
-  };
-  if (v >= t[0].v) return 100;
-  if (v <= t[sizeof(t)/sizeof(t[0]) - 1].v) return 0;
-  for (size_t i = 0; i + 1 < sizeof(t)/sizeof(t[0]); i++) {
-    if (v <= t[i].v && v >= t[i+1].v) {
-      float k = (v - t[i+1].v) / (t[i].v - t[i+1].v);
-      return (int)roundf(t[i+1].p + k * (t[i].p - t[i+1].p));
-    }
-  }
-  return -1;
-}
-
-static void batteryUpdate() {
-  if (BATTERY_ADC_PIN < 0) return;
-  if (millis() - last_batt_ms < 1500) return;
-  last_batt_ms = millis();
-
-  // Подстраховка: если ADC не настроен — всё равно попробуем
-  analogReadResolution(12);
-  int raw = analogRead(BATTERY_ADC_PIN); // 0..4095
-  float v_adc = (raw / 4095.0f) * 3.3f;
-  float v_batt = v_adc * BATTERY_DIVIDER_RATIO;
-
-  battery_v = v_batt;
-  battery_pct = socFromVoltage(v_batt);
-}
-
-// -------------------- Settings load/save --------------------
-static void loadSettings() {
-  prefs.begin("rls", true);
-  cfg.center_us     = prefs.getInt("center", 1500);
-  cfg.left_span_us  = prefs.getInt("lspan", 100);
-  cfg.right_span_us = prefs.getInt("rspan", 100);
-  cfg.bias_right_us = prefs.getInt("biasR", 0);
-  cfg.bias_left_us  = prefs.getInt("biasL", 0);
-  cfg.scan_period_ms= prefs.getInt("period", 9000);
-  cfg.tick_ms       = prefs.getInt("tick", 20);
-  cfg.servo_hold    = prefs.getBool("hold", true);
-  prefs.end();
-
-  // Безопасные границы
-  cfg.center_us      = clampi(cfg.center_us, 800, 2200);
-  cfg.left_span_us   = clampi(cfg.left_span_us, 0, 600);
-  cfg.right_span_us  = clampi(cfg.right_span_us, 0, 600);
-  cfg.bias_right_us  = clampi(cfg.bias_right_us, -200, 200);
-  cfg.bias_left_us   = clampi(cfg.bias_left_us, -200, 200);
-  cfg.scan_period_ms = clampi(cfg.scan_period_ms, 1000, 30000);
-  cfg.tick_ms        = clampi(cfg.tick_ms, 10, 200);
-}
-
-static void saveSettings() {
-  prefs.begin("rls", false);
-  prefs.putInt("center", cfg.center_us);
-  prefs.putInt("lspan", cfg.left_span_us);
-  prefs.putInt("rspan", cfg.right_span_us);
-  prefs.putInt("biasR", cfg.bias_right_us);
-  prefs.putInt("biasL", cfg.bias_left_us);
-  prefs.putInt("period", cfg.scan_period_ms);
-  prefs.putInt("tick", cfg.tick_ms);
-  prefs.putBool("hold", cfg.servo_hold);
-  prefs.end();
-}
-
-// -------------------- Servo scan update (главное: НЕ “прибавлять step”, а считать по времени) --------------------
-static int computeServoUsFromPhase(uint32_t now) {
-  int minUs = cfg.center_us - cfg.left_span_us;
-  int maxUs = cfg.center_us + cfg.right_span_us;
-  minUs = clampi(minUs, 500, 2500);
-  maxUs = clampi(maxUs, 500, 2500);
-
-  uint32_t T = (uint32_t)cfg.scan_period_ms;
-  if (T < 1000) T = 1000;
-  uint32_t t = (now - scan_start_ms) % T;
-
-  float half = T * 0.5f;
-  float f;
-  if (t < half) {
-    f = (float)t / half;     // 0..1 (лево -> право)
-    servo_dir = +1;
-  } else {
-    f = (float)(T - t) / half; // 1..0 (право -> лево)
-    servo_dir = -1;
-  }
-
-  float us = minUs + (maxUs - minUs) * f;
-
-  // Directional bias (если надо компенсировать “серво несимметричное”)
-  if (servo_dir > 0) us += cfg.bias_right_us;
-  else us += cfg.bias_left_us;
-
-  return clampi((int)roundf(us), 500, 2500);
-}
-
-static void updateServo() {
+  int period = clampi(cfg.scan_period_ms, 800, 60000);
   uint32_t now = millis();
 
-  if (!servo_enabled) return;
-  if (now - last_servo_update_ms < (uint32_t)cfg.tick_ms) return;
-  last_servo_update_ms = now;
+  // треугольник 0..1..0
+  uint32_t t = (now - scan_start_ms) % (uint32_t)period;
+  float p = (float)t / (float)period; // 0..1
 
-  int us = computeServoUsFromPhase(now);
-  servoWriteUs(us);
+  float x; // 0..1
+  if (p < 0.5f) {
+    x = p * 2.0f;      // 0..1
+    servo_dir = 'R';
+  } else {
+    x = (1.0f - p) * 2.0f; // 1..0
+    servo_dir = 'L';
+  }
+
+  // easing
+  float mix = clampf(cfg.ease_pct / 100.0f, 0, 1);
+  float xe = x * (1.0f - mix) + smoothstep(x) * mix;
+
+  int usL = cfg.center_us - cfg.left_span_us;
+  int usR = cfg.center_us + cfg.right_span_us;
+  if (usR <= usL) usR = usL + 1;
+
+  int us = (int)roundf(usL + (usR - usL) * xe);
+
+  // направленные bias
+  if (servo_dir == 'R') us += cfg.bias_right_us;
+  else us += cfg.bias_left_us;
+
+  // крайние ограничения
+  int minUs = usL - 300;
+  int maxUs = usR + 300;
+  servo_us_cmd = clampi(us, minUs, maxUs);
 }
 
-// -------------------- Radar power toggle --------------------
-static void setRadarPower(bool on) {
-  radar_powered = on;
-  if (RADAR_PWR_PIN < 0) return;
-
-  pinMode(RADAR_PWR_PIN, OUTPUT);
-  if (RADAR_PWR_ACTIVE_HIGH) digitalWrite(RADAR_PWR_PIN, on ? HIGH : LOW);
-  else digitalWrite(RADAR_PWR_PIN, on ? LOW : HIGH);
+// угол для UI (0..180)
+static float servoAngleDeg() {
+  int usL = cfg.center_us - cfg.left_span_us;
+  int usR = cfg.center_us + cfg.right_span_us;
+  if (usR <= usL) return 90;
+  float pos = (float)(servo_us_cmd - usL) / (float)(usR - usL);
+  pos = clampf(pos, 0, 1);
+  return pos * 180.0f;
 }
 
-// -------------------- HTML --------------------
+// -------------------- BATTERY --------------------
+static int batteryPercentFromV(float v) {
+  // Литий 1S приблизительно (можно потом уточнить по твоей батарее)
+  if (v <= 3.20f) return 0;
+  if (v >= 4.20f) return 100;
+  // кусочно-линейно (лучше чем просто линейка)
+  struct Pt { float v; int p; };
+  static const Pt pts[] = {
+    {3.20f,0}, {3.30f,3}, {3.40f,8}, {3.50f,15}, {3.60f,25},
+    {3.70f,40}, {3.80f,55}, {3.90f,70}, {4.00f,85}, {4.10f,95}, {4.20f,100}
+  };
+  for (size_t i=1;i<sizeof(pts)/sizeof(pts[0]);i++){
+    if (v <= pts[i].v) {
+      float v0=pts[i-1].v, v1=pts[i].v;
+      int p0=pts[i-1].p, p1=pts[i].p;
+      float k=(v-v0)/(v1-v0);
+      return (int)roundf(p0 + (p1-p0)*k);
+    }
+  }
+  return 100;
+}
+
+static void batteryService() {
+  if (BAT_ADC_PIN < 0) { bat_pct = -1; return; }
+  uint32_t now = millis();
+  if (now - last_bat_ms < 900) return;
+  last_bat_ms = now;
+
+  analogReadResolution(12);
+
+  uint32_t mv = analogReadMilliVolts(BAT_ADC_PIN);
+  float vadc = (float)mv / 1000.0f;
+  float v = vadc * BAT_DIVIDER;
+  bat_v = v;
+  bat_pct = batteryPercentFromV(v);
+}
+
+// -------------------- RADAR SERVICE --------------------
+static void radarService() {
+  if (!radar_on) return;
+
+  // Самый базовый вариант: OUT-пин = движение/тихо
+  bool m = false;
+  if (RADAR_OUT_PIN >= 0) {
+    pinMode(RADAR_OUT_PIN, INPUT);
+    m = (digitalRead(RADAR_OUT_PIN) == HIGH);
+  }
+
+  motion_prev = motion_now;
+  motion_now = m;
+
+  if (motion_now) last_motion_ms = millis();
+
+  // Если движение есть — добавляем "точку" на текущем угле
+  // range и speed — пока базово (если у тебя есть UART-данные, добавим позже)
+  if (motion_now) {
+    float ang = servoAngleDeg();
+    float range_cm = 120.0f; // ПЛЕЙСХОЛДЕР: без UART дальность неизвестна
+    float v_kmh = 0.0f;
+    int dir = 0;
+    addHit(ang, range_cm, v_kmh, dir);
+    said_clear = false;
+  }
+
+  // речь (события)
+  if (motion_now && !motion_prev) {
+    speak_seq++;
+    speak_text = "Обнаружено движение";
+  }
+
+  // “пространство чисто” после тишины
+  if (!motion_now) {
+    uint32_t now = millis();
+    if (!said_clear && (now - last_motion_ms) > 5000) {
+      speak_seq++;
+      speak_text = "Пространство чисто";
+      said_clear = true;
+    }
+  }
+}
+
+// -------------------- FAILSAFE --------------------
+static void failsafeService() {
+  if (!cfg.failsafe_stop) return;
+  uint32_t now = millis();
+  if ((now - last_client_ms) > (uint32_t)cfg.failsafe_sec * 1000UL) {
+    // выключаем всё
+    servo_scan_on = false;
+    if (!cfg.servo_hold_when_stop) servoPWM(false);
+    radar_on = false;
+    radarPower(false);
+  }
+}
+
+// -------------------- HTML UI --------------------
 static const char INDEX_HTML[] PROGMEM = R"HTML(
-<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>РЛС (ESP32‑C6)</title>
+<!doctype html><html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RLS</title>
 <style>
-  :root{ --g:#00ff66; --g2:#00aa44; --bg:#000; --card:#07120b; --b:#0b2a16; }
-  body{ margin:0; background:var(--bg); color:var(--g); font-family:system-ui,Segoe UI,Roboto,Arial; }
-  .top{ position:sticky; top:0; background:#000; border-bottom:1px solid var(--b); padding:10px; display:flex; gap:8px; align-items:center; z-index:5;}
-  .btn{ background:#06210f; border:1px solid var(--b); color:var(--g); padding:10px 12px; border-radius:12px; font-weight:600;}
-  .btn:active{ transform:scale(.99); }
-  .tabbtn{ opacity:.9; }
-  .tabbtn.active{ border-color:var(--g); }
-  .wrap{ padding:12px; max-width:900px; margin:0 auto; }
-  .card{ background:var(--card); border:1px solid var(--b); border-radius:16px; padding:12px; margin:12px 0; }
-  canvas{ width:100%; height:auto; display:block; border-radius:14px; background:#000; border:1px solid var(--b); }
-  .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-  .stat{ font-size:18px; font-weight:700; }
-  .sub{ opacity:.9; font-family:ui-monospace,Menlo,Consolas,monospace; }
-  .slider{ width:100%; }
-  label{ display:block; margin-top:12px; font-weight:700; }
-  .kv{ display:flex; justify-content:space-between; gap:12px; font-family:ui-monospace,Menlo,Consolas,monospace; opacity:.95; }
-  .hr{ height:1px; background:var(--b); margin:12px 0; }
-  .pill{ border:1px solid var(--b); padding:6px 10px; border-radius:999px; background:#03180a; }
-  .danger{ border-color:#ff3355; color:#ff88aa; }
-  .ok{ border-color:#00ff66; }
+  body{margin:0;background:#060b07;color:#8fffa8;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+  .top{display:flex;gap:10px;padding:10px;background:#020402;position:sticky;top:0;z-index:2}
+  .btn{border:1px solid #1e6b3a;background:rgba(0,0,0,.4);color:#8fffa8;padding:10px 14px;border-radius:22px;font-weight:650}
+  .btn:active{transform:scale(.98)}
+  .pill{border:1px solid #1e6b3a;background:rgba(0,0,0,.35);padding:10px 14px;border-radius:22px}
+  .wrap{max-width:900px;margin:0 auto;padding:12px}
+  .card{border:1px solid #1e6b3a;border-radius:18px;padding:14px;margin:12px 0;background:rgba(0,0,0,.25)}
+  canvas{width:100%;height:auto;border-radius:16px;border:1px solid #1e6b3a;background:#000}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .grow{flex:1}
+  .label{opacity:.9}
+  input[type=range]{width:100%}
+  .small{font-size:13px;opacity:.9}
+  .tab{display:none}
+  .tab.on{display:block}
+  .big{font-size:22px;font-weight:800}
 </style>
 </head>
 <body>
   <div class="top">
-    <button class="btn tabbtn active" id="tRadar" onclick="showTab('radar')">Радар</button>
-    <button class="btn tabbtn" id="tServo" onclick="showTab('servo')">Сервопривод</button>
-    <span class="pill" id="wifiPill">AP: 192.168.4.1</span>
-    <span class="pill" id="batPill">Батарея: —</span>
+    <button class="btn" onclick="showTab('radar')">Радар</button>
+    <button class="btn" onclick="showTab('servo')">Сервопривод</button>
+    <button class="btn" onclick="showTab('bat')">Батарея</button>
+    <div class="pill">AP: <span id="ip">—</span></div>
+    <div class="pill">Заряд: <span id="batTop">—</span></div>
   </div>
 
   <div class="wrap">
-
-    <div id="tab-radar">
+    <!-- RADAR TAB -->
+    <div id="tab-radar" class="tab on">
       <div class="card">
-        <canvas id="cv" width="700" height="420"></canvas>
+        <canvas id="cv" width="900" height="420"></canvas>
       </div>
-
       <div class="card">
-        <div class="stat" id="statusTitle">Статус: …</div>
-        <div class="sub" id="statusLine">…</div>
-        <div class="hr"></div>
-
-        <div class="row">
-          <button class="btn" onclick="toggleServo()" id="btnServo">Сканирование: …</button>
-          <button class="btn" onclick="toggleRadar()" id="btnRadar">Радар: …</button>
-          <button class="btn" onclick="toggleVoice()" id="btnVoice">Озвучка: …</button>
+        <div class="big">Статус: <span id="status">—</span></div>
+        <div class="small" id="dbg">—</div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn" id="btnScan" onclick="toggleScan()">Сканирование: СТАРТ</button>
+          <button class="btn" id="btnRadar" onclick="toggleRadar()">Радар: ВКЛ</button>
+          <button class="btn" id="btnVoice" onclick="toggleVoice()">Озвучка: ВКЛ</button>
         </div>
-
-        <div class="hr"></div>
-        <div class="sub" id="hint">
-          • Точки: цвет/размер зависят от скорости и направления.<br>
-          • Если озвучка не говорит — нажми любую кнопку (некоторые браузеры требуют жест пользователя).
+        <div class="small" style="margin-top:10px">
+          Если озвучка молчит — нажми любую кнопку (браузеры требуют жест).
         </div>
       </div>
     </div>
 
-    <div id="tab-servo" style="display:none">
+    <!-- SERVO TAB -->
+    <div id="tab-servo" class="tab">
       <div class="card">
-        <div class="stat">Настройки сервопривода</div>
+        <div class="big">Настройки сервопривода</div>
 
-        <label>Center (µs): <span id="vCenter">—</span></label>
-        <input class="slider" id="center" type="range" min="800" max="2200" step="1" />
+        <div class="label">Center (us): <b id="cV">1500</b></div>
+        <input id="center" type="range" min="1200" max="1800" value="1500" oninput="cV.textContent=this.value">
 
-        <label>Left span (µs): <span id="vL">—</span></label>
-        <input class="slider" id="lspan" type="range" min="0" max="400" step="1" />
+        <div class="label">Left span (us): <b id="lV">100</b></div>
+        <input id="lspan" type="range" min="10" max="400" value="100" oninput="lV.textContent=this.value">
 
-        <label>Right span (µs): <span id="vR">—</span></label>
-        <input class="slider" id="rspan" type="range" min="0" max="400" step="1" />
+        <div class="label">Right span (us): <b id="rV">100</b></div>
+        <input id="rspan" type="range" min="10" max="400" value="100" oninput="rV.textContent=this.value">
 
-        <label>Bias right (µs): <span id="vBR">—</span></label>
-        <input class="slider" id="biasR" type="range" min="-60" max="60" step="1" />
+        <div class="label">Bias right (us): <b id="brV">0</b></div>
+        <input id="br" type="range" min="-80" max="80" value="0" oninput="brV.textContent=this.value">
 
-        <label>Bias left (µs): <span id="vBL">—</span></label>
-        <input class="slider" id="biasL" type="range" min="-60" max="60" step="1" />
+        <div class="label">Bias left (us): <b id="blV">0</b></div>
+        <input id="bl" type="range" min="-80" max="80" value="0" oninput="blV.textContent=this.value">
 
-        <label>Scan period (ms): <span id="vP">—</span></label>
-        <input class="slider" id="period" type="range" min="2000" max="20000" step="100" />
+        <div class="label">Scan period (ms): <b id="pV">9000</b></div>
+        <input id="period" type="range" min="800" max="30000" value="9000" oninput="pV.textContent=this.value">
 
-        <label>Tick (ms): <span id="vT">—</span></label>
-        <input class="slider" id="tick" type="range" min="10" max="120" step="1" />
+        <div class="label">Ease (% плавность к краям): <b id="eV">35</b></div>
+        <input id="ease" type="range" min="0" max="100" value="35" oninput="eV.textContent=this.value">
 
-        <div class="hr"></div>
-        <div class="row">
-          <button class="btn" onclick="centerNow()">Center (встать в центр)</button>
-          <button class="btn" onclick="testLeft()">Тест Лево</button>
-          <button class="btn" onclick="testRight()">Тест Право</button>
+        <div class="label">Tick UI (ms): <b id="tV">120</b></div>
+        <input id="tick" type="range" min="80" max="600" value="120" oninput="tV.textContent=this.value">
+
+        <div class="row" style="margin-top:12px">
+          <button class="btn" onclick="servoCenter()">Center</button>
+          <button class="btn" onclick="servoTest('L')">Тест Лево</button>
+          <button class="btn" onclick="servoTest('R')">Тест Право</button>
         </div>
 
-        <div class="row" style="margin-top:10px">
-          <button class="btn ok" onclick="apply()">Применить</button>
-          <button class="btn ok" onclick="save()">Save (сохранить)</button>
-          <button class="btn danger" onclick="resetPrefs()">Сброс настроек</button>
+        <div class="row" style="margin-top:12px">
+          <button class="btn" onclick="applyServo()">Применить</button>
+          <button class="btn" onclick="saveCfg()">Save</button>
+          <button class="btn" onclick="togglePWM()">PWM: ON/OFF</button>
         </div>
 
-        <div class="hr"></div>
-        <div class="sub" id="diag">Диагностика: …</div>
+        <div class="card" style="margin-top:14px">
+          <div class="big">Диагностика</div>
+          <div class="small" id="servoDiag">—</div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- BAT TAB -->
+    <div id="tab-bat" class="tab">
+      <div class="card">
+        <div class="big">Батарея</div>
+        <div>Напряжение: <b id="batV">—</b></div>
+        <div>Процент: <b id="batP">—</b></div>
+        <div class="small" style="margin-top:10px">
+          Чтобы заработало — нужен делитель напряжения на ADC (иначе будет "—").
+        </div>
       </div>
     </div>
 
   </div>
 
 <script>
-let S = null;
-let inited=false;
-let blips=[];
-const BLIP_LIFE=4500;
-
-let voiceEnabled = JSON.parse(localStorage.getItem('voiceEnabled') ?? 'true');
-let lastSpeak=0;
-let lastClear=0;
-let lastAnyDet=0;
-const SPEAK_COOLDOWN=2500;
-const CLEAR_AFTER=3500;
-const CLEAR_COOLDOWN=15000;
+let voiceOn = true;
+let lastSpeakSeq = 0;
+let scanOn = false;
+let radarOn = false;
+let pwmOn = false;
 
 function showTab(name){
-  document.getElementById('tab-radar').style.display = (name==='radar')?'block':'none';
-  document.getElementById('tab-servo').style.display = (name==='servo')?'block':'none';
-  document.getElementById('tRadar').classList.toggle('active', name==='radar');
-  document.getElementById('tServo').classList.toggle('active', name==='servo');
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+  document.getElementById('tab-'+name).classList.add('on');
 }
 
-function speak(txt){
-  if(!voiceEnabled) return;
-  const now=Date.now();
-  if(now-lastSpeak < SPEAK_COOLDOWN) return;
-  lastSpeak=now;
-  try{
-    window.speechSynthesis.cancel();
-    const u=new SpeechSynthesisUtterance(txt);
-    u.lang='ru-RU';
-    window.speechSynthesis.speak(u);
-  }catch(e){}
+function say(text){
+  if(!voiceOn) return;
+  if(!('speechSynthesis' in window)) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'ru-RU';
+  speechSynthesis.cancel();
+  speechSynthesis.speak(u);
+}
+
+async function api(url){
+  const r = await fetch(url);
+  return await r.json();
 }
 
 function toggleVoice(){
-  voiceEnabled=!voiceEnabled;
-  localStorage.setItem('voiceEnabled', JSON.stringify(voiceEnabled));
-  updateButtons();
+  voiceOn = !voiceOn;
+  document.getElementById('btnVoice').textContent = 'Озвучка: ' + (voiceOn?'ВКЛ':'ВЫКЛ');
+  if(voiceOn) say('Озвучка включена');
 }
 
-function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
-
-function classify(speed){
-  // speed < 0 => к нам, >0 => от нас
-  const a=Math.abs(speed);
-  let size=2, color='#ffff33';
-  if(a < 1.2){ size=2; color='#ffff33'; }
-  else if(a < 6){ size=3; color=(speed<0)?'#ff8800':'#00aaff'; }      // “пешком/медленно”
-  else if(a < 18){ size=4; color=(speed<0)?'#ff2222':'#22ffff'; }     // “быстро”
-  else { size=6; color=(speed<0)?'#ff00ff':'#8888ff'; }               // “транспорт/очень быстро”
-  return {size,color};
+async function toggleScan(){
+  scanOn = !scanOn;
+  await api('/api/cmd?scan='+(scanOn?1:0));
 }
 
-function addBlip(angle, dist_cm, speed){
-  const now=Date.now();
-  blips.push({angle, dist_cm, speed, t:now});
-  // чистим старые
-  blips = blips.filter(b => now-b.t < BLIP_LIFE);
+async function toggleRadar(){
+  radarOn = !radarOn;
+  await api('/api/cmd?radar='+(radarOn?1:0));
 }
 
-function draw(){
-  const cv=document.getElementById('cv');
-  const ctx=cv.getContext('2d');
+async function togglePWM(){
+  pwmOn = !pwmOn;
+  await api('/api/cmd?pwm='+(pwmOn?1:0));
+}
 
-  const W=cv.width, H=cv.height;
-  ctx.clearRect(0,0,W,H);
+async function applyServo(){
+  const q = new URLSearchParams({
+    center:center.value, lspan:lspan.value, rspan:rspan.value,
+    br:br.value, bl:bl.value, period:period.value,
+    ease:ease.value, tick:tick.value
+  });
+  await api('/api/set?'+q.toString());
+}
 
-  if(!S || !S.radarEnabled){
-    // радар выключен — просто надпись
-    ctx.fillStyle='#00ff66';
+async function saveCfg(){ await api('/api/save'); say('Сохранено'); }
+
+async function servoCenter(){ await api('/api/cmd?center=1'); }
+
+async function servoTest(dir){ await api('/api/cmd?test='+dir); }
+
+function draw(state){
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0,0,cv.width,cv.height);
+
+  if(!state.radar_on){
+    ctx.fillStyle='#001a08';
+    ctx.fillRect(0,0,cv.width,cv.height);
+    ctx.fillStyle='#8fffa8';
     ctx.font='28px system-ui';
-    ctx.fillText('РАДАР ВЫКЛЮЧЕН', 40, 80);
+    ctx.fillText('РАДАР ВЫКЛЮЧЕН', 280, 210);
     return;
   }
 
   // grid
-  const ox=W/2, oy=H-10;
-  const R=Math.min(W/2-20, H-20);
-
-  ctx.strokeStyle='#00aa44';
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,cv.width,cv.height);
+  ctx.strokeStyle='#1e6b3a';
   ctx.lineWidth=2;
 
-  // дуги
-  for(let k=1;k<=4;k++){
+  const cx = cv.width/2;
+  const cy = cv.height-10;
+  const R = Math.min(cv.width*0.47, cv.height*0.95);
+
+  // arcs
+  for(let i=1;i<=4;i++){
     ctx.beginPath();
-    ctx.arc(ox, oy, R*(k/4), Math.PI, 0);
+    ctx.arc(cx,cy,R*i/4,Math.PI,2*Math.PI);
     ctx.stroke();
   }
-  // лучи
+  // spokes
   for(let a=0;a<=180;a+=30){
-    const rad=(180-a)*Math.PI/180;
-    const x=ox+Math.cos(rad)*R;
-    const y=oy-Math.sin(rad)*R;
+    const rad = Math.PI + (a*Math.PI/180);
     ctx.beginPath();
-    ctx.moveTo(ox,oy);
-    ctx.lineTo(x,y);
+    ctx.moveTo(cx,cy);
+    ctx.lineTo(cx+Math.cos(rad)*R, cy+Math.sin(rad)*R);
     ctx.stroke();
   }
-  // базовая линия
-  ctx.beginPath();
-  ctx.moveTo(ox-R, oy);
-  ctx.lineTo(ox+R, oy);
-  ctx.stroke();
 
-  // blips
-  const maxRange = 600; // см (можно потом сделать настройкой)
-  const now=Date.now();
-  for(const b of blips){
-    const age=now-b.t;
-    const alpha=clamp(1 - age/BLIP_LIFE, 0, 1);
-    const rr=clamp(b.dist_cm/maxRange, 0, 1);
-    const rad=(180-b.angle)*Math.PI/180;
-    const x=ox+Math.cos(rad)*R*rr;
-    const y=oy-Math.sin(rad)*R*rr;
-
-    const cs=classify(b.speed);
-    ctx.globalAlpha=alpha;
-    ctx.fillStyle=cs.color;
-    ctx.beginPath();
-    ctx.arc(x,y, cs.size+2, 0, Math.PI*2);
-    ctx.fill();
-  }
-  ctx.globalAlpha=1;
-
-  // sweep
-  const rad=(180-S.angle)*Math.PI/180;
-  const sx=ox+Math.cos(rad)*R;
-  const sy=oy-Math.sin(rad)*R;
+  // sweep line
+  const ang = state.servo_angle_deg || 0;
+  const rad = Math.PI + (ang*Math.PI/180);
   ctx.strokeStyle='#00ff66';
   ctx.lineWidth=4;
   ctx.beginPath();
-  ctx.moveTo(ox,oy);
-  ctx.lineTo(sx,sy);
+  ctx.moveTo(cx,cy);
+  ctx.lineTo(cx+Math.cos(rad)*R, cy+Math.sin(rad)*R);
   ctx.stroke();
-}
 
-function updateButtons(){
-  document.getElementById('btnVoice').textContent = 'Озвучка: ' + (voiceEnabled?'ВКЛ':'ВЫКЛ');
-  if(S){
-    document.getElementById('btnServo').textContent = 'Сканирование: ' + (S.servoEnabled?'СТОП':'СТАРТ');
-    document.getElementById('btnRadar').textContent = 'Радар: ' + (S.radarEnabled?'ВЫКЛ':'ВКЛ');
+  // hits
+  const hits = state.hits || [];
+  const now = Date.now();
+  for(const h of hits){
+    const age = (now - h.ts);
+    if(age > 7000) continue;
+    const alpha = Math.max(0, 1 - age/7000);
+    let col = 'rgba(0,255,120,'+alpha+')';
+    let size = 6;
+
+    if(h.dir > 0){ col = 'rgba(255,80,80,'+alpha+')'; size = 8 + Math.min(10, Math.abs(h.v_kmh||0)); }
+    else if(h.dir < 0){ col = 'rgba(80,160,255,'+alpha+')'; size = 7 + Math.min(8, Math.abs(h.v_kmh||0)); }
+
+    const a = Math.PI + (h.angle_deg*Math.PI/180);
+    const rr = R * Math.min(1.0, (h.range_cm||120)/400.0); // 400см шкала по умолчанию
+    const x = cx + Math.cos(a)*rr;
+    const y = cy + Math.sin(a)*rr;
+
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.arc(x,y,size,0,Math.PI*2);
+    ctx.fill();
   }
 }
 
-function uiInit(){
-  if(inited || !S) return;
-  inited=true;
-
-  const set = (id,val)=>{ const el=document.getElementById(id); el.value=val; };
-  set('center', S.center);
-  set('lspan', S.lspan);
-  set('rspan', S.rspan);
-  set('biasR', S.biasR);
-  set('biasL', S.biasL);
-  set('period', S.period);
-  set('tick', S.tick);
-
-  bindSliders();
-  refreshSliderText();
-  updateButtons();
-}
-
-function refreshSliderText(){
-  const g=(id)=>document.getElementById(id);
-  document.getElementById('vCenter').textContent = g('center').value;
-  document.getElementById('vL').textContent = g('lspan').value;
-  document.getElementById('vR').textContent = g('rspan').value;
-  document.getElementById('vBR').textContent = g('biasR').value;
-  document.getElementById('vBL').textContent = g('biasL').value;
-  document.getElementById('vP').textContent = g('period').value;
-  document.getElementById('vT').textContent = g('tick').value;
-}
-
-let applyTimer=null;
-function bindSliders(){
-  const ids=['center','lspan','rspan','biasR','biasL','period','tick'];
-  for(const id of ids){
-    document.getElementById(id).addEventListener('input', ()=>{
-      refreshSliderText();
-      // лёгкий debounce
-      if(applyTimer) clearTimeout(applyTimer);
-      applyTimer=setTimeout(apply, 200);
-    });
-  }
-}
-
-async function apply(){
-  const q = new URLSearchParams({
-    center:document.getElementById('center').value,
-    lspan:document.getElementById('lspan').value,
-    rspan:document.getElementById('rspan').value,
-    biasR:document.getElementById('biasR').value,
-    biasL:document.getElementById('biasL').value,
-    period:document.getElementById('period').value,
-    tick:document.getElementById('tick').value
-  });
-  await fetch('/api/set?'+q.toString(), {cache:'no-store'});
-}
-
-async function save(){
-  await fetch('/api/set?save=1', {cache:'no-store'});
-  speak('Настройки сохранены');
-}
-
-async function resetPrefs(){
-  if(!confirm('Сбросить настройки сервопривода?')) return;
-  await fetch('/api/reset', {cache:'no-store'});
-}
-
-async function toggleServo(){
-  if(!S) return;
-  await fetch('/api/set?servo='+(S.servoEnabled?0:1), {cache:'no-store'});
-}
-
-async function toggleRadar(){
-  if(!S) return;
-  await fetch('/api/set?radar='+(S.radarEnabled?0:1), {cache:'no-store'});
-}
-
-async function centerNow(){
-  await fetch('/api/set?centerNow=1', {cache:'no-store'});
-}
-
-async function testLeft(){
-  await fetch('/api/set?test=left', {cache:'no-store'});
-}
-async function testRight(){
-  await fetch('/api/set?test=right', {cache:'no-store'});
-}
-
-function updateStatus(){
-  if(!S) return;
-
-  const st = document.getElementById('statusTitle');
-  const ln = document.getElementById('statusLine');
-  const diag = document.getElementById('diag');
-
-  const pres = S.presence ? 'Движение' : 'Тихо';
-  st.textContent = 'Статус: ' + (S.radarEnabled ? pres : 'Радар выключен');
-
-  ln.textContent = `angle=${S.angle}°, us=${S.us}, dir=${S.dir}, OUT=${S.out}, range=${S.range_cm}cm, v=${S.speed_kmh.toFixed(1)}km/h`;
-
-  diag.innerHTML =
-    `Диагностика:<br>`+
-    `• servoEnabled=${S.servoEnabled}, servoAttached=${S.servoAttached}<br>`+
-    `• center=${S.center}, L=${S.lspan}, R=${S.rspan}, biasR=${S.biasR}, biasL=${S.biasL}<br>`+
-    `• period=${S.period}ms, tick=${S.tick}ms<br>`+
-    `• range=${S.range_cm}cm, speed=${S.speed_kmh.toFixed(1)}km/h, moveDir=${S.moveDir}`;
-
-  // батарея
-  const bp = document.getElementById('batPill');
-  if(S.batt_pct >= 0){
-    bp.textContent = `Батарея: ${S.batt_pct}% (${S.batt_v.toFixed(2)}V)`;
-  }else{
-    bp.textContent = 'Батарея: —';
-  }
-
-  updateButtons();
-}
-
-let lastAnnouncedMove = 0; // -1/+1/0
-function handleVoiceAndBlips(){
-  if(!S || !S.radarEnabled) return;
-
-  const now=Date.now();
-
-  if(S.presence && S.range_cm > 0){
-    addBlip(S.angle, S.range_cm, S.speed_kmh);
-    lastAnyDet = now;
-
-    // озвучка только когда реально "движется" и меняется направление
-    if(S.moveDir !== 0 && S.moveDir !== lastAnnouncedMove){
-      lastAnnouncedMove = S.moveDir;
-      const sp = Math.abs(S.speed_kmh).toFixed(0);
-      if(S.moveDir < 0) speak(`Объект движется к нам. Скорость ${sp} километров в час`);
-      else speak(`Объект удаляется. Скорость ${sp} километров в час`);
-    }
-  }else{
-    // если долго никого
-    if(now-lastAnyDet > CLEAR_AFTER && now-lastClear > CLEAR_COOLDOWN){
-      lastClear = now;
-      lastAnnouncedMove = 0;
-      speak('Пространство чисто');
-    }
-  }
-}
-
-async function poll(){
+async function loop(){
   try{
-    const r = await fetch('/api/state', {cache:'no-store'});
-    S = await r.json();
-    uiInit();
-    updateStatus();
-    handleVoiceAndBlips();
-    draw();
-  }catch(e){
-    // молча
-  }
-  const d = (S && S.tick) ? Math.max(80, Math.min(400, S.tick*3)) : 200;
-  setTimeout(poll, d);
-}
+    const state = await api('/api/state');
 
-updateButtons();
-poll();
+    ip.textContent = state.ip || '192.168.4.1';
+    status.textContent = state.motion ? 'Движение' : 'Тихо';
+    dbg.textContent = `angle=${(state.servo_angle_deg||0).toFixed(1)}°, us=${state.servo_us}, dir=${state.servo_dir}, OUT=${state.motion?1:0}`;
+
+    scanOn = !!state.scan_on;
+    radarOn = !!state.radar_on;
+    pwmOn  = !!state.pwm_on;
+
+    btnScan.textContent  = 'Сканирование: ' + (scanOn?'СТОП':'СТАРТ');
+    btnRadar.textContent = 'Радар: ' + (radarOn?'ВЫКЛ':'ВКЛ');
+
+    if(state.bat_pct>=0){
+      batTop.textContent = state.bat_pct+'%';
+      batV.textContent = (state.bat_v||0).toFixed(2)+'V';
+      batP.textContent = state.bat_pct+'%';
+      batP.style.opacity = 1;
+    }else{
+      batTop.textContent = '—';
+      batV.textContent = '—';
+      batP.textContent = '—';
+    }
+
+    // servo tab values (sync once)
+    cV.textContent = center.value = state.cfg.center_us;
+    lV.textContent = lspan.value  = state.cfg.left_span_us;
+    rV.textContent = rspan.value  = state.cfg.right_span_us;
+    brV.textContent = br.value    = state.cfg.bias_right_us;
+    blV.textContent = bl.value    = state.cfg.bias_left_us;
+    pV.textContent = period.value = state.cfg.scan_period_ms;
+    eV.textContent = ease.value   = state.cfg.ease_pct;
+    tV.textContent = tick.value   = state.cfg.tick_ms;
+
+    // servo diag
+    servoDiag.textContent =
+      `PWM=${pwmOn?'ON':'OFF'} | Scan=${scanOn?'ON':'OFF'} | us=${state.servo_us} | `+
+      `min=${state.min_us} max=${state.max_us} | совет: min>=900, max<=2100`;
+
+    draw(state);
+
+    // speak event
+    if(state.speak_seq && state.speak_seq !== lastSpeakSeq){
+      lastSpeakSeq = state.speak_seq;
+      if(state.speak_text) say(state.speak_text);
+    }
+
+    setTimeout(loop, state.cfg.tick_ms || 150);
+  }catch(e){
+    setTimeout(loop, 600);
+  }
+}
+loop();
 </script>
-</body>
-</html>
+</body></html>
 )HTML";
 
-// -------------------- API handlers --------------------
+// -------------------- API --------------------
+static void markClient() { last_client_ms = millis(); }
+
 static void handleIndex() {
-  server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+  markClient();
+  server.send(200, "text/html; charset=utf-8", FPSTR(INDEX_HTML));
 }
 
 static void handleState() {
-  // OUT пин (если есть)
-  int outv = -1;
-  if (RADAR_OUT_PIN >= 0) outv = digitalRead(RADAR_OUT_PIN);
+  markClient();
 
-  int angle = servoAngleDegFromUs(servo_us_cmd);
+  // собираем hits (последние 32, с ts)
+  String hitsJson = "[";
+  bool first = true;
+  uint32_t now = millis();
+  for (int i=0;i<MAX_HITS;i++){
+    const Hit &h = hits[i];
+    if (h.ts == 0) continue;
+    if ((now - h.ts) > 8000) continue;
+    if (!first) hitsJson += ",";
+    first = false;
+    hitsJson += "{";
+    hitsJson += "\"angle_deg\":" + String(h.angle_deg,1) + ",";
+    hitsJson += "\"range_cm\":" + String(h.range_cm,1) + ",";
+    hitsJson += "\"v_kmh\":" + String(h.v_kmh,1) + ",";
+    hitsJson += "\"dir\":" + String(h.dir) + ",";
+    hitsJson += "\"ts\":" + String((uint32_t)h.ts);
+    hitsJson += "}";
+  }
+  hitsJson += "]";
 
-  // если UART давно молчит — можно fallback на OUT
-  bool pres = radar_presence;
-  if (millis() - last_radar_line_ms > 2500 && outv != -1) pres = (outv == HIGH);
+  int usL = cfg.center_us - cfg.left_span_us;
+  int usR = cfg.center_us + cfg.right_span_us;
 
   String json = "{";
-  json += "\"servoEnabled\":" + String(servo_enabled ? "true" : "false") + ",";
-  json += "\"servoAttached\":" + String(servo_attached ? "true" : "false") + ",";
-  json += "\"radarEnabled\":" + String(radar_enabled ? "true" : "false") + ",";
-  json += "\"angle\":" + String(angle) + ",";
-  json += "\"us\":" + String(servo_us_cmd) + ",";
-  json += "\"dir\":\"" + String(servo_dir > 0 ? "R" : "L") + "\",";
-  json += "\"out\":" + String(outv) + ",";
-  json += "\"presence\":" + String(pres ? "true" : "false") + ",";
-  json += "\"range_cm\":" + String(radar_range_cm) + ",";
-  json += "\"speed_kmh\":" + String(speed_kmh, 2) + ",";
-  json += "\"moveDir\":" + String(move_dir) + ",";
-
-  json += "\"center\":" + String(cfg.center_us) + ",";
-  json += "\"lspan\":" + String(cfg.left_span_us) + ",";
-  json += "\"rspan\":" + String(cfg.right_span_us) + ",";
-  json += "\"biasR\":" + String(cfg.bias_right_us) + ",";
-  json += "\"biasL\":" + String(cfg.bias_left_us) + ",";
-  json += "\"period\":" + String(cfg.scan_period_ms) + ",";
-  json += "\"tick\":" + String(cfg.tick_ms) + ",";
-
-  if (BATTERY_ADC_PIN >= 0 && !isnan(battery_v) && battery_pct >= 0) {
-    json += "\"batt_v\":" + String(battery_v, 3) + ",";
-    json += "\"batt_pct\":" + String(battery_pct);
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"scan_on\":" + String(servo_scan_on ? 1:0) + ",";
+  json += "\"pwm_on\":" + String(servo_pwm_on ? 1:0) + ",";
+  json += "\"radar_on\":" + String(radar_on ? 1:0) + ",";
+  json += "\"radar_powered\":" + String(radar_powered ? 1:0) + ",";
+  json += "\"servo_us\":" + String(servo_us_cmd) + ",";
+  json += "\"servo_dir\":\"" + String(servo_dir) + "\",";
+  json += "\"servo_angle_deg\":" + String(servoAngleDeg(),1) + ",";
+  json += "\"motion\":" + String(motion_now ? 1:0) + ",";
+  if (bat_pct >= 0) {
+    json += "\"bat_v\":" + String(bat_v,2) + ",";
+    json += "\"bat_pct\":" + String(bat_pct) + ",";
   } else {
-    json += "\"batt_v\":0,";
-    json += "\"batt_pct\":-1";
+    json += "\"bat_v\":0,\"bat_pct\":-1,";
   }
-
+  json += "\"min_us\":" + String(usL) + ",";
+  json += "\"max_us\":" + String(usR) + ",";
+  json += "\"hits\":" + hitsJson + ",";
+  json += "\"speak_seq\":" + String(speak_seq) + ",";
+  json += "\"speak_text\":\"" + jsonEscape(speak_text) + "\",";
+  json += "\"cfg\":{";
+  json += "\"center_us\":" + String(cfg.center_us) + ",";
+  json += "\"left_span_us\":" + String(cfg.left_span_us) + ",";
+  json += "\"right_span_us\":" + String(cfg.right_span_us) + ",";
+  json += "\"bias_right_us\":" + String(cfg.bias_right_us) + ",";
+  json += "\"bias_left_us\":" + String(cfg.bias_left_us) + ",";
+  json += "\"scan_period_ms\":" + String(cfg.scan_period_ms) + ",";
+  json += "\"tick_ms\":" + String(cfg.tick_ms) + ",";
+  json += "\"ease_pct\":" + String(cfg.ease_pct);
   json += "}";
-
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", json);
+  json += "}";
+  server.send(200, "application/json; charset=utf-8", json);
 }
 
 static void handleSet() {
-  // настройки
-  if (server.hasArg("center")) cfg.center_us = clampi(server.arg("center").toInt(), 800, 2200);
-  if (server.hasArg("lspan"))  cfg.left_span_us = clampi(server.arg("lspan").toInt(), 0, 600);
-  if (server.hasArg("rspan"))  cfg.right_span_us = clampi(server.arg("rspan").toInt(), 0, 600);
-  if (server.hasArg("biasR"))  cfg.bias_right_us = clampi(server.arg("biasR").toInt(), -200, 200);
-  if (server.hasArg("biasL"))  cfg.bias_left_us = clampi(server.arg("biasL").toInt(), -200, 200);
-  if (server.hasArg("period")) cfg.scan_period_ms = clampi(server.arg("period").toInt(), 1000, 30000);
-  if (server.hasArg("tick"))   cfg.tick_ms = clampi(server.arg("tick").toInt(), 10, 200);
+  markClient();
+  if (server.hasArg("center")) cfg.center_us = clampi(server.arg("center").toInt(), 1200, 1800);
+  if (server.hasArg("lspan"))  cfg.left_span_us = clampi(server.arg("lspan").toInt(), 10, 500);
+  if (server.hasArg("rspan"))  cfg.right_span_us = clampi(server.arg("rspan").toInt(), 10, 500);
+  if (server.hasArg("br"))     cfg.bias_right_us = clampi(server.arg("br").toInt(), -120, 120);
+  if (server.hasArg("bl"))     cfg.bias_left_us = clampi(server.arg("bl").toInt(), -120, 120);
+  if (server.hasArg("period")) cfg.scan_period_ms = clampi(server.arg("period").toInt(), 800, 60000);
+  if (server.hasArg("tick"))   cfg.tick_ms = clampi(server.arg("tick").toInt(), 80, 1200);
+  if (server.hasArg("ease"))   cfg.ease_pct = clampi(server.arg("ease").toInt(), 0, 100);
 
-  // команды
-  if (server.hasArg("servo")) {
-    int v = server.arg("servo").toInt();
+  server.send(200, "application/json; charset=utf-8", "{\"ok\":1}");
+}
+
+static void handleCmd() {
+  markClient();
+
+  if (server.hasArg("scan")) {
+    int v = server.arg("scan").toInt();
     if (v == 1) {
-      servo_enabled = true;
-      scan_start_ms = millis();
-      // чтобы серво не “дёрнулось”, ставим центр и только потом начинаем скан
-      servoWriteUs(cfg.center_us);
+      // старт сканирования: включаем питание (если есть ключ) + PWM
+      servoPower(true);
+      servoPWM(true);
+      servo_scan_on = true;
+
+      // старт из центра и вправо
+      scan_start_ms = millis() - (uint32_t)clampi(cfg.scan_period_ms,800,60000) / 4;
+      speak_seq++; speak_text = "Сканирование запущено";
     } else {
-      servo_enabled = false;
-      if (cfg.servo_hold) {
-        // остаёмся удерживать текущую позицию
-        servoWriteUs(servo_us_cmd);
-      } else {
-        // полностью отключаем PWM
-        servoDetachIfNeeded();
-      }
+      servo_scan_on = false;
+      if (!cfg.servo_hold_when_stop) servoPWM(false);
+      speak_seq++; speak_text = "Сканирование остановлено";
     }
+  }
+
+  if (server.hasArg("pwm")) {
+    int v = server.arg("pwm").toInt();
+    if (v == 1) { servoPower(true); servoPWM(true); }
+    else { servoPWM(false); }
   }
 
   if (server.hasArg("radar")) {
     int v = server.arg("radar").toInt();
-    radar_enabled = (v == 1);
-    if (!radar_enabled) {
-      move_dir = 0;
-      speed_kmh = 0;
-      radar_presence = false;
-      radar_range_cm = 0;
-      if (RADAR_PWR_PIN >= 0) setRadarPower(false);
+    if (v == 1) {
+      radar_on = true;
+      radarPower(true);
+      said_clear = false;
+      speak_seq++; speak_text = "Радар включен";
     } else {
-      if (RADAR_PWR_PIN >= 0) setRadarPower(true);
+      radar_on = false;
+      radarPower(false);
+      speak_seq++; speak_text = "Радар выключен";
     }
   }
 
-  if (server.hasArg("centerNow")) {
-    servoWriteUs(cfg.center_us);
+  if (server.hasArg("center")) {
+    // ручной центр без сканирования
+    servo_scan_on = false;
+    servoPower(true);
+    servoPWM(true);
+    servo_us_cmd = cfg.center_us;
+    speak_seq++; speak_text = "Центр";
   }
 
   if (server.hasArg("test")) {
-    String t = server.arg("test");
-    int leftUs = cfg.center_us - cfg.left_span_us;
-    int rightUs = cfg.center_us + cfg.right_span_us;
-    if (t == "left") servoWriteUs(leftUs);
-    if (t == "right") servoWriteUs(rightUs);
+    String d = server.arg("test");
+    servo_scan_on = false;
+    servoPower(true);
+    servoPWM(true);
+    if (d == "L") servo_us_cmd = cfg.center_us - cfg.left_span_us;
+    if (d == "R") servo_us_cmd = cfg.center_us + cfg.right_span_us;
   }
 
-  if (server.hasArg("save")) {
-    saveSettings();
-  }
-
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "text/plain", "OK");
+  server.send(200, "application/json; charset=utf-8", "{\"ok\":1}");
 }
 
-static void handleResetPrefs() {
-  prefs.begin("rls", false);
-  prefs.clear();
+static void cfgLoad() {
+  prefs.begin("rls", true);
+  cfg.center_us = prefs.getInt("center", cfg.center_us);
+  cfg.left_span_us = prefs.getInt("lspan", cfg.left_span_us);
+  cfg.right_span_us = prefs.getInt("rspan", cfg.right_span_us);
+  cfg.bias_right_us = prefs.getInt("br", cfg.bias_right_us);
+  cfg.bias_left_us = prefs.getInt("bl", cfg.bias_left_us);
+  cfg.scan_period_ms = prefs.getInt("period", cfg.scan_period_ms);
+  cfg.tick_ms = prefs.getInt("tick", cfg.tick_ms);
+  cfg.ease_pct = prefs.getInt("ease", cfg.ease_pct);
   prefs.end();
-  server.send(200, "text/plain", "RESET");
-  delay(200);
-  ESP.restart();
 }
 
-// -------------------- Setup/Loop --------------------
+static void cfgSave() {
+  prefs.begin("rls", false);
+  prefs.putInt("center", cfg.center_us);
+  prefs.putInt("lspan", cfg.left_span_us);
+  prefs.putInt("rspan", cfg.right_span_us);
+  prefs.putInt("br", cfg.bias_right_us);
+  prefs.putInt("bl", cfg.bias_left_us);
+  prefs.putInt("period", cfg.scan_period_ms);
+  prefs.putInt("tick", cfg.tick_ms);
+  prefs.putInt("ease", cfg.ease_pct);
+  prefs.end();
+}
+
+static void handleSave() {
+  markClient();
+  cfgSave();
+  server.send(200, "application/json; charset=utf-8", "{\"ok\":1}");
+}
+
+// OTA (опционально, удобно с телефона)
+static void handleUpdatePage() {
+  markClient();
+  String html = "<html><body style='background:#000;color:#8fffa8;font-family:system-ui'>"
+                "<h2>OTA Update</h2>"
+                "<p>Загружай файл <b>Esp32c6-radar.ino.bin</b> (НЕ merged.bin).</p>"
+                "<form method='POST' action='/update' enctype='multipart/form-data'>"
+                "<input type='file' name='update' accept='.bin'>"
+                "<input type='submit' value='Upload'>"
+                "</form></body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+static void handleUpdateUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Update.begin(UPDATE_SIZE_UNKNOWN);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    Update.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      server.send(200, "text/plain", "OK. Rebooting...");
+      delay(300);
+      ESP.restart();
+    } else {
+      server.send(500, "text/plain", "Update failed");
+    }
+  }
+}
+
+// -------------------- SETUP/LOOP --------------------
 void setup() {
-#if !RADAR_USE_SERIAL0
-  Serial.begin(115200);
-  delay(200);
-  DBGLN("Boot...");
-#endif
+  // Серво на старте НЕ должно крутиться
+  pinMode(SERVO_PIN, OUTPUT);
+  digitalWrite(SERVO_PIN, LOW);
+  servoPWM(false);
+  servoPower(false);
 
-  loadSettings();
+  // Радар по умолчанию выключен
+  radar_on = cfg.radar_enabled_default;
+  radarPower(false);
 
-  // По умолчанию: серво НЕ стартует
-  servo_enabled = false;
-  servo_attached = false;
-  servo_us_cmd = cfg.center_us;
+  cfgLoad();
 
-  if (RADAR_OUT_PIN >= 0) {
-    pinMode(RADAR_OUT_PIN, INPUT);
-  }
-
-  if (RADAR_PWR_PIN >= 0) setRadarPower(true);
-
-  // UART радара
-#if RADAR_USE_SERIAL0
-  Serial.begin(RADAR_BAUD);
-#else
-  RadarSerial.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
-#endif
-
-  // Пытаемся перевести LD2420 в Basic text mode (ON/OFF + Range XXXX)
-  if (radar_enabled) {
-    delay(250);
-    ld2420SetBasicStatusMode();
-#if !RADAR_USE_SERIAL0
-    DBGLN("LD2420: set basic status mode");
-#endif
-  }
-
-  // Wi‑Fi AP
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
-  delay(100);
-#if !RADAR_USE_SERIAL0
-  DBGLN("AP started: " + WiFi.softAPIP().toString());
-#endif
+  delay(200);
 
-  // routes
   server.on("/", handleIndex);
-  server.on("/api/state", HTTP_GET, handleState);
-  server.on("/api/set", HTTP_GET, handleSet);
-  server.on("/api/reset", HTTP_GET, handleResetPrefs);
-  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.on("/api/state", handleState);
+  server.on("/api/set", handleSet);
+  server.on("/api/cmd", handleCmd);
+  server.on("/api/save", handleSave);
+
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, [](){}, handleUpdateUpload);
+
   server.begin();
+
+  last_client_ms = millis();
+  last_motion_ms = millis();
 }
 
 void loop() {
   server.handleClient();
-  radarPollSerial();
-  updateServo();
-  batteryUpdate();
+
+  // 1) сервис сканирования (не накапливает ошибки)
+  servoScanService();
+
+  // 2) сервис импульсов (строго 50Hz, когда PWM включен)
+  servoService50Hz();
+
+  // 3) радар
+  radarService();
+
+  // 4) батарея
+  batteryService();
+
+  // 5) failsafe
+  failsafeService();
 }
